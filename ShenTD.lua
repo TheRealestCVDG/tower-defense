@@ -283,7 +283,7 @@ end
 --// 3. CONFIGURATION & STATE
 --// =========================================================================
 
-local VERSION = "1.2.1"
+local VERSION = "1.3.0"
 local PLAYBACK_MODES = { "Hybrid", "Money", "Time" }
 local MUTATOR_MODES = { "Off", "Refuse (None)", "Highest Bonus" }
 local MAP_FALLBACK = { "Duels", "Towers", "ShinjukuStation", "Endless", "Nightmare" }
@@ -314,6 +314,8 @@ local DEFAULT_CFG = {
     PlaybackMode = "Hybrid",
     AutoPlayback = false,
     IgnoreMapCheck = false,
+    AutoExecOnTeleport = false,
+    AutoExecUrl = "",
 }
 
 local function cloneDefaults()
@@ -333,6 +335,7 @@ local State = {
     UpdatingAmountInput = false,
     UpdatingMacroNameInput = false,
     UpdatingStopSkipInput = false,
+    UpdatingAutoExecUrlInput = false,
     Window = nil,
     WindUI = nil,
     Connections = {},
@@ -384,6 +387,11 @@ local State = {
     RecordHandles = setmetatable({}, { __mode = "k" }),
     PlaybackHandles = {},
     NextMacroHandle = 0,
+    AutoPlayedForSerial = 0,
+    AutoPlayFailedForSerial = 0,
+    AutoPlayEligibleAt = 0,
+    TeleportQueueStatus = "Off",
+    LastQueuedPayload = nil,
 }
 
 function SafeUtils.trackConnection(conn)
@@ -2665,6 +2673,7 @@ function PlaybackEngine.stop()
     State.PlaybackHandles = {}
     State.PlaybackWaitReason = ""
     State.MacroStatus = "Playback stopped"
+    State.AutoPlayedForSerial = MatchState.getMatchSerial()
     return true
 end
 
@@ -2675,6 +2684,7 @@ end
 local ConfigManager = {
     Folder = "ShenanigansTDConfigs",
     AutoloadFile = "_autoload.txt",
+    TeleportStateFile = "_teleport_state.json",
     WidgetRefreshers = {},
 }
 
@@ -2692,6 +2702,42 @@ end
 
 function ConfigManager:GetAutoloadPath()
     return self.Folder .. "/" .. self.AutoloadFile
+end
+
+function ConfigManager:GetTeleportStatePath()
+    return self.Folder .. "/" .. self.TeleportStateFile
+end
+
+function ConfigManager:ApplyData(data)
+    if type(data) ~= "table" then
+        return
+    end
+    for k, defaultVal in pairs(DEFAULT_CFG) do
+        local loadedVal = data[k]
+        if type(loadedVal) == type(defaultVal) then
+            if k == "SummonAmount" then
+                CFG[k] = math.max(1, math.floor(loadedVal))
+            elseif k == "SummonDelay" then
+                CFG[k] = math.clamp(loadedVal, 0, 10)
+            elseif k == "VoteMapDelay" or k == "ReplayDelay" then
+                CFG[k] = math.clamp(loadedVal, 0, 15)
+            elseif k == "StopSkipWave" then
+                CFG[k] = math.max(0, math.floor(loadedVal))
+            elseif k == "PlaybackMode" then
+                if table.find(PLAYBACK_MODES, loadedVal) then
+                    CFG[k] = loadedVal
+                end
+            elseif k == "AutoMutatorMode" then
+                if table.find(MUTATOR_MODES, loadedVal) then
+                    CFG[k] = loadedVal
+                end
+            elseif k == "AutoExecUrl" then
+                CFG[k] = tostring(loadedVal):gsub("^%s+", ""):gsub("%s+$", "")
+            else
+                CFG[k] = loadedVal
+            end
+        end
+    end
 end
 
 function ConfigManager:RunWithApplyGuard(fn)
@@ -2720,7 +2766,7 @@ function ConfigManager:ListConfigs()
         local normalized = tostring(fullPath):gsub("\\", "/")
         local fileName = normalized:match("([^/]+)$") or normalized
         local base = fileName:match("^(.+)%.json$")
-        if base and base ~= "" then
+        if base and base ~= "" and fileName ~= self.TeleportStateFile then
             table.insert(out, base)
         end
     end
@@ -2781,31 +2827,7 @@ function ConfigManager:Load(name)
         return false, "Invalid JSON in config"
     end
 
-    for k, defaultVal in pairs(DEFAULT_CFG) do
-        local loadedVal = data[k]
-        if type(loadedVal) == type(defaultVal) then
-            if k == "SummonAmount" then
-                CFG[k] = math.max(1, math.floor(loadedVal))
-            elseif k == "SummonDelay" then
-                CFG[k] = math.clamp(loadedVal, 0, 10)
-            elseif k == "VoteMapDelay" or k == "ReplayDelay" then
-                CFG[k] = math.clamp(loadedVal, 0, 15)
-            elseif k == "StopSkipWave" then
-                CFG[k] = math.max(0, math.floor(loadedVal))
-            elseif k == "PlaybackMode" then
-                if table.find(PLAYBACK_MODES, loadedVal) then
-                    CFG[k] = loadedVal
-                end
-            elseif k == "AutoMutatorMode" then
-                if table.find(MUTATOR_MODES, loadedVal) then
-                    CFG[k] = loadedVal
-                end
-            else
-                CFG[k] = loadedVal
-            end
-        end
-    end
-
+    self:ApplyData(data)
     self:RefreshWidgets()
     return true, clean
 end
@@ -2817,6 +2839,211 @@ function ConfigManager:Delete(name)
         self:ClearAutoload()
     end
     return ok, clean
+end
+
+function ConfigManager:SaveTeleportState()
+    if not SafeUtils.ensureFolder(self.Folder) then
+        return false
+    end
+    local payload = {
+        SavedAt = os.time(),
+        CFG = CFG,
+    }
+    local okEnc, encoded = SafeUtils.jsonEncode(payload)
+    if not okEnc then
+        return false
+    end
+    return SafeUtils.writeTextFile(self:GetTeleportStatePath(), encoded)
+end
+
+function ConfigManager:LoadTeleportState()
+    local okRead, content = SafeUtils.readTextFile(self:GetTeleportStatePath())
+    if not okRead or not content then
+        return false
+    end
+    local okDec, data = SafeUtils.jsonDecode(content)
+    if not okDec or type(data) ~= "table" or type(data.CFG) ~= "table" then
+        return false
+    end
+    if data.CFG.AutoExecOnTeleport ~= true then
+        return false
+    end
+    local age = os.time() - (tonumber(data.SavedAt) or 0)
+    if age > 1800 then
+        return false
+    end
+    self:ApplyData(data.CFG)
+    self:RefreshWidgets()
+    return true
+end
+
+function ConfigManager:ClearTeleportState()
+    return SafeUtils.deleteFile(self:GetTeleportStatePath())
+end
+
+--// =========================================================================
+--// 9B. TELEPORT AUTO-EXEC MODULE
+--// =========================================================================
+
+local TeleportAutoExec = {}
+
+function TeleportAutoExec.getQueueFn()
+    local candidates = {
+        type(queue_on_teleport) == "function" and queue_on_teleport or nil,
+        type(queueonteleport) == "function" and queueonteleport or nil,
+        type(queueteleport) == "function" and queueteleport or nil,
+        type(GlobalEnv.queue_on_teleport) == "function" and GlobalEnv.queue_on_teleport or nil,
+        type(GlobalEnv.queueonteleport) == "function" and GlobalEnv.queueonteleport or nil,
+        type(syn) == "table" and type(syn.queue_on_teleport) == "function" and syn.queue_on_teleport or nil,
+        type(fluxus) == "table" and type(fluxus.queue_on_teleport) == "function" and fluxus.queue_on_teleport or nil,
+    }
+    for _, fn in ipairs(candidates) do
+        if type(fn) == "function" then
+            return fn
+        end
+    end
+    return nil
+end
+
+function TeleportAutoExec.getClearFn()
+    local candidates = {
+        type(clearqueueonteleport) == "function" and clearqueueonteleport or nil,
+        type(clearteleportqueue) == "function" and clearteleportqueue or nil,
+        type(clear_teleport_queue) == "function" and clear_teleport_queue or nil,
+        type(GlobalEnv.clearqueueonteleport) == "function" and GlobalEnv.clearqueueonteleport or nil,
+    }
+    for _, fn in ipairs(candidates) do
+        if type(fn) == "function" then
+            return fn
+        end
+    end
+    return nil
+end
+
+function TeleportAutoExec.isSupported()
+    return type(TeleportAutoExec.getQueueFn()) == "function"
+end
+
+function TeleportAutoExec.findLocalScriptPath()
+    if type(isfile) ~= "function" then
+        return nil
+    end
+    for _, candidate in ipairs({ "ShenanigansTDConfigs/_autoexec_script.lua", "shenanigans_td.lua", "ShenTD.lua" }) do
+        local ok, exists = pcall(isfile, candidate)
+        if ok and exists == true then
+            return candidate
+        end
+    end
+    return nil
+end
+
+function TeleportAutoExec.getEffectiveUrl()
+    local cfgUrl = tostring(CFG.AutoExecUrl or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if cfgUrl:match("^https?://") then
+        return cfgUrl
+    end
+    local envUrl = type(GlobalEnv.ShenanigansTDLoaderUrl) == "string"
+        and GlobalEnv.ShenanigansTDLoaderUrl:gsub("^%s+", ""):gsub("%s+$", "")
+        or ""
+    if envUrl:match("^https?://") then
+        return envUrl
+    end
+    return ""
+end
+
+function TeleportAutoExec.buildLoaderSource()
+    local url = TeleportAutoExec.getEffectiveUrl()
+    local quotedUrl = string.format("%q", url)
+    local lines = {
+        "local url = " .. quotedUrl,
+        "if not game:IsLoaded() then pcall(function() game.Loaded:Wait() end) end",
+        "local Players = game:GetService('Players')",
+        "local t0 = os.clock()",
+        "while not Players.LocalPlayer and (os.clock() - t0) < 20 do task.wait(0.1) end",
+        "task.wait(0.75)",
+        "local src = nil",
+        "if url ~= '' then",
+        "    local ok, res = pcall(function() return game:HttpGet(url) end)",
+        "    if ok and type(res) == 'string' and #res > 100 then",
+        "        src = res",
+        "        if type(isfolder) == 'function' and type(makefolder) == 'function' and type(writefile) == 'function' then",
+        "            pcall(function()",
+        "                if not isfolder('ShenanigansTDConfigs') then makefolder('ShenanigansTDConfigs') end",
+        "                writefile('ShenanigansTDConfigs/_autoexec_script.lua', res)",
+        "            end)",
+        "        end",
+        "    end",
+        "end",
+        "if (not src or src == '') and type(isfile) == 'function' and type(readfile) == 'function' then",
+        "    for _, p in ipairs({ 'ShenanigansTDConfigs/_autoexec_script.lua', 'shenanigans_td.lua', 'ShenTD.lua' }) do",
+        "        local okE, exists = pcall(isfile, p)",
+        "        if okE and exists then",
+        "            local okR, data = pcall(readfile, p)",
+        "            if okR and type(data) == 'string' and #data > 100 then",
+        "                src = data",
+        "                break",
+        "            end",
+        "        end",
+        "    end",
+        "end",
+        "if type(src) == 'string' and #src > 100 then",
+        "    if url ~= '' and type(getgenv) == 'function' then pcall(function() getgenv().ShenanigansTDLoaderUrl = url end) end",
+        "    local fn, err = loadstring(src)",
+        "    if type(fn) == 'function' then task.spawn(fn) else warn('[ShenanigansTD AutoExec] Compile error: ' .. tostring(err)) end",
+        "else",
+        "    warn('[ShenanigansTD AutoExec] No script source found (set Auto-Run Script URL or keep shenanigans_td.lua in workspace).')",
+        "end",
+    }
+    return table.concat(lines, "\n")
+end
+
+function TeleportAutoExec.clear()
+    local clearFn = TeleportAutoExec.getClearFn()
+    if type(clearFn) == "function" then
+        pcall(clearFn)
+    end
+    State.LastQueuedPayload = nil
+    State.TeleportQueueStatus = "Off"
+end
+
+function TeleportAutoExec.sync(forceRequeue)
+    if not CFG.AutoExecOnTeleport then
+        TeleportAutoExec.clear()
+        ConfigManager:ClearTeleportState()
+        return true, "Off"
+    end
+
+    local queueFn = TeleportAutoExec.getQueueFn()
+    if type(queueFn) ~= "function" then
+        State.TeleportQueueStatus = "Unsupported by executor"
+        return false, "Executor does not support queue_on_teleport"
+    end
+
+    ConfigManager:SaveTeleportState()
+
+    local url = TeleportAutoExec.getEffectiveUrl()
+    local localPath = TeleportAutoExec.findLocalScriptPath()
+    if url == "" and not localPath then
+        State.TeleportQueueStatus = "Needs URL or local file"
+        return false, "No local script file found — enter your raw script URL in Auto-Run Script URL"
+    end
+
+    local payload = TeleportAutoExec.buildLoaderSource()
+    if forceRequeue or State.LastQueuedPayload ~= payload then
+        local clearFn = TeleportAutoExec.getClearFn()
+        if type(clearFn) == "function" then
+            pcall(clearFn)
+        end
+        local ok, err = pcall(queueFn, payload)
+        if not ok then
+            State.TeleportQueueStatus = "Queue failed"
+            return false, tostring(err)
+        end
+        State.LastQueuedPayload = payload
+    end
+
+    State.TeleportQueueStatus = url ~= "" and "Armed (URL)" or ("Armed (" .. tostring(localPath) .. ")")
+    return true, State.TeleportQueueStatus
 end
 
 --// =========================================================================
@@ -2936,6 +3163,7 @@ local function buildMacroStatusText()
         "Status: " .. tostring(State.MacroStatus),
         string.format("Loaded Macro: %s (Map: %s | Actions: %d)", loadedName, loadedMap, actionCount),
         string.format("Playback Mode: %s | Hook: %s", tostring(CFG.PlaybackMode), tostring(State.MacroHookStatus)),
+        string.format("Auto-Run New Match: %s", tostring(State.TeleportQueueStatus)),
     }
     return table.concat(lines, "\n")
 end
@@ -3003,12 +3231,23 @@ local function setAmountToMax(showNotify)
     return true, maxCount, cash
 end
 
-local function destroy()
+local function onSettingChanged()
+    if CFG.AutoExecOnTeleport then
+        ConfigManager:SaveTeleportState()
+    end
+end
+
+local function destroy(isManualUnload)
     if not State.Running then
         return
     end
     State.Running = false
     CFG.AutoSummon = false
+    if isManualUnload == true then
+        CFG.AutoExecOnTeleport = false
+        pcall(TeleportAutoExec.clear)
+        pcall(ConfigManager.ClearTeleportState, ConfigManager)
+    end
     pcall(PlaybackEngine.stop)
     if State.Recording then
         pcall(ActionRecorder.stop)
@@ -3080,6 +3319,7 @@ local function buildUI()
                     return
                 end
                 setter(v == true)
+                onSettingChanged()
                 updateStatusDisplay()
                 updateMatchDisplay()
                 updateMacroDisplay()
@@ -3106,6 +3346,7 @@ local function buildUI()
                 local num = tonumber(v)
                 if num then
                     setter(num)
+                    onSettingChanged()
                 end
             end,
         })
@@ -3260,6 +3501,7 @@ local function buildUI()
             if type(v) == "string" and v ~= "" then
                 CFG.VoteMapName = v
                 State.VoteSent = false
+                onSettingChanged()
             end
         end,
     })
@@ -3349,6 +3591,7 @@ local function buildUI()
             local parsed = SafeUtils.parseNonNegativeInt(v)
             if parsed ~= nil then
                 CFG.StopSkipWave = parsed
+                onSettingChanged()
             end
         end,
     })
@@ -3407,6 +3650,7 @@ local function buildUI()
             if table.find(MUTATOR_MODES, v) then
                 CFG.AutoMutatorMode = v
                 State.LastMutatorOptions = ""
+                onSettingChanged()
             end
         end,
     })
@@ -3481,6 +3725,7 @@ local function buildUI()
                 return
             end
             CFG.MacroName = SafeUtils.cleanName(v)
+            onSettingChanged()
         end,
     })
     table.insert(ConfigManager.WidgetRefreshers, function()
@@ -3515,6 +3760,8 @@ local function buildUI()
             else
                 CFG.SelectedMacro = ""
             end
+            State.AutoPlayFailedForSerial = 0
+            onSettingChanged()
             updateMacroDisplay()
         end,
     })
@@ -3543,6 +3790,7 @@ local function buildUI()
                 CFG.SelectedMacro = msg
                 CFG.MacroName = msg
                 State.MacroStatus = string.format("Saved %s (%d actions)", msg, count or 0)
+                onSettingChanged()
             end
             refreshMacroUI()
             notify("Macro", ok and ("Saved " .. tostring(msg) .. " (" .. tostring(count) .. " actions)") or tostring(msg), 3)
@@ -3567,6 +3815,8 @@ local function buildUI()
                     State.UpdatingMacroNameInput = false
                 end
                 State.MacroStatus = string.format("Loaded %s (%d actions)", msg, count or 0)
+                State.AutoPlayFailedForSerial = 0
+                onSettingChanged()
             end
             updateMacroDisplay()
             notify("Macro", ok and ("Loaded " .. tostring(msg) .. " (" .. tostring(count) .. " actions)") or tostring(msg), 3)
@@ -3610,6 +3860,7 @@ local function buildUI()
             end
             if table.find(PLAYBACK_MODES, v) then
                 CFG.PlaybackMode = v
+                onSettingChanged()
                 updateMacroDisplay()
             end
         end,
@@ -3665,6 +3916,7 @@ local function buildUI()
         return CFG.AutoPlayback
     end, function(v)
         CFG.AutoPlayback = v
+        State.AutoPlayFailedForSerial = 0
     end)
 
     registerToggle(TabMacro, {
@@ -3674,6 +3926,45 @@ local function buildUI()
         return CFG.IgnoreMapCheck
     end, function(v)
         CFG.IgnoreMapCheck = v
+        State.AutoPlayFailedForSerial = 0
+    end)
+
+    registerToggle(TabMacro, {
+        Title = "Auto-Run in New Match",
+        Desc = "Automatically reloads the hub & macro session when teleporting to a match.",
+    }, function()
+        return CFG.AutoExecOnTeleport
+    end, function(v)
+        CFG.AutoExecOnTeleport = v
+        local okSync, msgSync = TeleportAutoExec.sync(true)
+        updateMacroDisplay()
+        notify("Auto-Run", okSync and ("Auto-Run: " .. tostring(msgSync)) or tostring(msgSync), 3.5)
+    end)
+
+    local autoExecUrlInput = TabMacro:Input({
+        Title = "Auto-Run Script URL (Optional)",
+        Desc = "Raw script URL for executors without a local workspace file.",
+        Placeholder = "https://raw.githubusercontent.com/...",
+        Value = CFG.AutoExecUrl,
+        Callback = function(v)
+            if State.ApplyingConfig or State.UpdatingAutoExecUrlInput or not State.UIReady then
+                return
+            end
+            CFG.AutoExecUrl = tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", "")
+            if CFG.AutoExecOnTeleport then
+                TeleportAutoExec.sync(true)
+            else
+                onSettingChanged()
+            end
+            updateMacroDisplay()
+        end,
+    })
+    table.insert(ConfigManager.WidgetRefreshers, function()
+        if autoExecUrlInput and type(autoExecUrlInput.Set) == "function" then
+            State.UpdatingAutoExecUrlInput = true
+            pcall(autoExecUrlInput.Set, autoExecUrlInput, tostring(CFG.AutoExecUrl))
+            State.UpdatingAutoExecUrlInput = false
+        end
     end)
 
     --// ---------------------------------------------------------------------
@@ -3736,6 +4027,10 @@ local function buildUI()
         Title = "Load Selected Config",
         Callback = function()
             local ok, msg = ConfigManager:Load(selectedConfig)
+            if ok then
+                TeleportAutoExec.sync(false)
+                onSettingChanged()
+            end
             refreshConfigUI()
             updateStatusDisplay()
             updateMatchDisplay()
@@ -3776,7 +4071,7 @@ local function buildUI()
         Title = "Unload Script",
         Desc = "Stops all loops, disconnects signals, and closes the UI.",
         Callback = function()
-            destroy()
+            destroy(true)
         end,
     })
 
@@ -3973,25 +4268,29 @@ local function startLoops()
                     end
 
                     -- Auto Playback on Match Start
-                    if (transition.started or transition.waveReset or transition.reopened)
-                        and transition.active
-                        and CFG.AutoPlayback
-                    then
-                        local triggerSerial = serial
-                        task.delay(0.75, function()
-                            if State.Running
-                                and MatchState.getMatchSerial() == triggerSerial
-                                and MatchState.isMatchActive()
-                                and CFG.AutoPlayback
-                                and not State.Playing
-                            then
-                                local okPlay, errPlay = PlaybackEngine.start()
-                                if not okPlay then
-                                    State.MacroStatus = "Auto playback: " .. tostring(errPlay)
+                    if not transition.active then
+                        State.AutoPlayEligibleAt = 0
+                    elseif CFG.AutoPlayback and not State.Playing and not State.Recording then
+                        if (type(State.ActiveMacro) == "table" or CFG.SelectedMacro ~= "")
+                            and State.AutoPlayedForSerial ~= serial
+                            and State.AutoPlayFailedForSerial ~= serial
+                        then
+                            if CFG.IgnoreMapCheck or MatchState.getCurrentMap() ~= "" then
+                                if State.AutoPlayEligibleAt == 0 then
+                                    State.AutoPlayEligibleAt = os.clock() + 0.75
+                                elseif os.clock() >= State.AutoPlayEligibleAt then
+                                    local okPlay, errPlay = PlaybackEngine.start()
+                                    if okPlay then
+                                        State.AutoPlayedForSerial = serial
+                                        State.AutoPlayEligibleAt = 0
+                                    else
+                                        State.AutoPlayFailedForSerial = serial
+                                        State.MacroStatus = "Auto playback: " .. tostring(errPlay)
+                                    end
+                                    updateMacroDisplay()
                                 end
-                                updateMacroDisplay()
                             end
-                        end)
+                        end
                     end
                 end)
                 if not okLoop then
@@ -4028,6 +4327,13 @@ State.LastMatchRunning = MatchState.isMatchRunning()
 State.LastMatchEnded = MatchState.isMatchEnded()
 State.LastWave = MatchState.getWave()
 
+if type(GlobalEnv.ShenanigansTDLoaderUrl) == "string"
+    and GlobalEnv.ShenanigansTDLoaderUrl:match("^https?://")
+    and CFG.AutoExecUrl == ""
+then
+    CFG.AutoExecUrl = GlobalEnv.ShenanigansTDLoaderUrl
+end
+
 local Window = buildUI()
 if Window then
     State.UIReady = true
@@ -4038,9 +4344,33 @@ if Window then
             notify("Autoload", "Loaded config: " .. tostring(msg), 2.5)
         end
     end
+    local restoredSession = ConfigManager:LoadTeleportState()
+    if restoredSession then
+        notify("Auto-Run", "Restored Match & Macro session", 2.5)
+    end
+    if CFG.SelectedMacro ~= "" and not State.ActiveMacro then
+        pcall(MacroManager.Load, MacroManager, CFG.SelectedMacro)
+    end
+    if CFG.AutoExecOnTeleport then
+        TeleportAutoExec.sync(true)
+    end
     updateStatusDisplay()
     updateMatchDisplay()
     updateMacroDisplay()
+end
+
+do
+    local lp = SafeUtils.getLocalPlayer()
+    if lp then
+        SafeUtils.trackConnection(lp.OnTeleport:Connect(function(teleportState)
+            if teleportState == Enum.TeleportState.Started or teleportState == Enum.TeleportState.InProgress then
+                if CFG.AutoExecOnTeleport then
+                    ConfigManager:SaveTeleportState()
+                    TeleportAutoExec.sync(false)
+                end
+            end
+        end))
+    end
 end
 
 hookCashSignals()
@@ -4057,6 +4387,7 @@ GlobalEnv[GLOBAL_KEY] = {
     ActionRecorder = ActionRecorder,
     PlaybackEngine = PlaybackEngine,
     ConfigManager = ConfigManager,
+    TeleportAutoExec = TeleportAutoExec,
     setAmountToMax = setAmountToMax,
     updateStatusDisplay = updateStatusDisplay,
     updateMatchDisplay = updateMatchDisplay,
